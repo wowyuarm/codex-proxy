@@ -4,9 +4,10 @@ import base64
 import hashlib
 import json
 import logging
+import os
 import secrets
+import subprocess
 import time
-import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from threading import Event, Thread
 from typing import Any
@@ -27,6 +28,25 @@ from codex_proxy.config import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def _get_proxy() -> str | None:
+    """Get HTTP proxy from environment."""
+    return os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+
+
+def _open_browser(url: str) -> None:
+    """Open browser suppressing stderr noise (dbus/ALSA errors on WSL)."""
+    try:
+        subprocess.Popen(
+            ["xdg-open", url],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        import webbrowser
+
+        webbrowser.open(url)
 
 
 def _generate_pkce() -> tuple[str, str]:
@@ -63,11 +83,24 @@ class _CallbackHandler(BaseHTTPRequestHandler):
 
     auth_code: str | None = None
     error: str | None = None
+    expected_state: str | None = None
     received = Event()
 
     def do_GET(self, /) -> None:
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
+
+        # Validate state parameter if we sent one
+        if _CallbackHandler.expected_state:
+            received_state = params.get("state", [None])[0]
+            if received_state != _CallbackHandler.expected_state:
+                _CallbackHandler.error = "state_mismatch"
+                self.send_response(400)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(b"<h1>Login failed: state mismatch</h1>")
+                _CallbackHandler.received.set()
+                return
 
         if "code" in params:
             _CallbackHandler.auth_code = params["code"][0]
@@ -75,12 +108,18 @@ class _CallbackHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/html")
             self.end_headers()
             self.wfile.write(b"<h1>Login successful!</h1><p>You can close this tab.</p>")
-        else:
-            _CallbackHandler.error = params.get("error", ["unknown"])[0]
+        elif "error" in params:
+            _CallbackHandler.error = params["error"][0]
             self.send_response(400)
             self.send_header("Content-Type", "text/html")
             self.end_headers()
-            self.wfile.write(b"<h1>Login failed</h1>")
+            error_desc = params.get("error_description", [""])[0]
+            self.wfile.write(f"<h1>Login failed: {error_desc}</h1>".encode())
+        else:
+            # Ignore unexpected requests (e.g. favicon.ico)
+            self.send_response(404)
+            self.end_headers()
+            return
 
         _CallbackHandler.received.set()
 
@@ -88,10 +127,11 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         pass  # Suppress default request logging
 
 
-def _wait_for_callback(timeout: float = 120.0) -> str:
+def _wait_for_callback(state: str, timeout: float = 120.0) -> str:
     """Start local server and wait for OAuth callback."""
     _CallbackHandler.auth_code = None
     _CallbackHandler.error = None
+    _CallbackHandler.expected_state = state
     _CallbackHandler.received = Event()
 
     server = HTTPServer(("127.0.0.1", CALLBACK_PORT), _CallbackHandler)
@@ -119,8 +159,9 @@ async def _exchange_code(code: str, code_verifier: str) -> dict[str, Any]:
         "code_verifier": code_verifier,
         "redirect_uri": REDIRECT_URI,
     }
+    proxy = _get_proxy()
     async with aiohttp.ClientSession() as session:
-        async with session.post(TOKEN_URL, data=data) as resp:
+        async with session.post(TOKEN_URL, data=data, proxy=proxy) as resp:
             if resp.status != 200:
                 body = await resp.text()
                 raise RuntimeError(f"Token exchange failed ({resp.status}): {body}")
@@ -134,8 +175,9 @@ async def _refresh_token(refresh_token: str) -> dict[str, Any]:
         "client_id": CLIENT_ID,
         "refresh_token": refresh_token,
     }
+    proxy = _get_proxy()
     async with aiohttp.ClientSession() as session:
-        async with session.post(TOKEN_URL, data=data) as resp:
+        async with session.post(TOKEN_URL, data=data, proxy=proxy) as resp:
             if resp.status != 200:
                 body = await resp.text()
                 raise RuntimeError(f"Token refresh failed ({resp.status}): {body}")
@@ -176,6 +218,7 @@ def is_expired(credentials: dict[str, Any], margin: float = 60.0) -> bool:
 async def login() -> dict[str, Any]:
     """Run the full OAuth PKCE login flow."""
     code_verifier, code_challenge = _generate_pkce()
+    state = secrets.token_urlsafe(32)
 
     params = urlencode(
         {
@@ -186,14 +229,15 @@ async def login() -> dict[str, Any]:
             "code_challenge": code_challenge,
             "code_challenge_method": "S256",
             "audience": "https://api.openai.com/v1",
+            "state": state,
         }
     )
     auth_url = f"{AUTHORIZE_URL}?{params}"
 
     print(f"Opening browser for login...\n  {auth_url}")
-    webbrowser.open(auth_url)
+    _open_browser(auth_url)
 
-    code = _wait_for_callback()
+    code = _wait_for_callback(state)
     log.info("Received authorization code")
 
     token_response = await _exchange_code(code, code_verifier)

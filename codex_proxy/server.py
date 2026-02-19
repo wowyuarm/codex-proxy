@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 
 import aiohttp
 from aiohttp import web
@@ -67,11 +68,13 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
     await response.prepare(request)
 
     try:
+        proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 RESPONSES_ENDPOINT,
                 json=responses_body,
                 headers=headers,
+                proxy=proxy,
             ) as upstream:
                 if upstream.status != 200:
                     error_text = await upstream.text()
