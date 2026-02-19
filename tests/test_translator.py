@@ -112,7 +112,7 @@ class TestChatToResponses:
         assert result["tools"][0]["name"] == "get_weather"
         assert result["tools"][0]["strict"] is False
 
-    def test_temperature_and_max_tokens(self):
+    def test_temperature_and_max_tokens_stripped(self):
         request = {
             "model": "gpt-5.1",
             "messages": [{"role": "user", "content": "Hi"}],
@@ -120,8 +120,8 @@ class TestChatToResponses:
             "max_tokens": 1024,
         }
         result = chat_to_responses(request)
-        assert result["temperature"] == 0.3
-        assert result["max_tokens"] == 1024
+        assert "temperature" not in result
+        assert "max_tokens" not in result
 
     def test_multipart_content(self):
         request = {

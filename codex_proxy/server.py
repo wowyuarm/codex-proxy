@@ -67,6 +67,8 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
     response.headers["X-Accel-Buffering"] = "no"
     await response.prepare(request)
 
+    log.info("Upstream request body: %s", json.dumps(responses_body)[:2000])
+
     proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
     try:
         async with AsyncSession(impersonate="chrome") as session:
@@ -80,8 +82,11 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
             )
 
             if upstream.status_code != 200:
-                error_text = upstream.text
-                log.error("Upstream error %d: %s", upstream.status_code, error_text[:500])
+                error_parts = []
+                async for chunk in upstream.aiter_content():
+                    error_parts.append(chunk.decode() if isinstance(chunk, bytes) else chunk)
+                error_text = "".join(error_parts)
+                log.error("Upstream error %d: %s", upstream.status_code, error_text[:1000])
                 error_chunk = json.dumps(
                     {
                         "error": {

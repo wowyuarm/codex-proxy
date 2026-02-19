@@ -71,8 +71,13 @@ def chat_to_responses(request: dict[str, Any]) -> dict[str, Any]:
                 }
             )
 
+    # Strip provider prefix (e.g. "vllm/gpt-5.1" → "gpt-5.1")
+    model = request.get("model", "gpt-5.1")
+    if "/" in model:
+        model = model.split("/", 1)[1]
+
     body: dict[str, Any] = {
-        "model": request.get("model", "gpt-5.1"),
+        "model": model,
         "stream": True,
         "store": False,
         "instructions": instructions or "You are a helpful assistant.",
@@ -85,11 +90,7 @@ def chat_to_responses(request: dict[str, Any]) -> dict[str, Any]:
     if request.get("tools"):
         body["tools"] = _convert_tools(request["tools"])
 
-    if request.get("temperature") is not None:
-        body["temperature"] = request["temperature"]
-
-    if request.get("max_tokens") is not None:
-        body["max_tokens"] = request["max_tokens"]
+    # Note: temperature and max_tokens are not supported by the Codex API
 
     return body
 
