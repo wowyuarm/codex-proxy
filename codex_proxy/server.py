@@ -77,56 +77,54 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
     )
     log.debug("Upstream request body: %s", json.dumps(responses_body)[:5000])
 
-    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
     try:
-        async with AsyncSession(impersonate="chrome") as session:
-            upstream = await session.post(
-                RESPONSES_ENDPOINT,
-                json=responses_body,
-                headers=headers,
-                proxies={"https": proxy} if proxy else None,
-                stream=True,
-                timeout=120,
-            )
+        session: AsyncSession = request.app["upstream_session"]
+        upstream = await session.post(
+            RESPONSES_ENDPOINT,
+            json=responses_body,
+            headers=headers,
+            stream=True,
+            timeout=120,
+        )
 
-            if upstream.status_code != 200:
-                error_parts = []
-                async for chunk in upstream.aiter_content():
-                    error_parts.append(chunk.decode() if isinstance(chunk, bytes) else chunk)
-                error_text = "".join(error_parts)
-                log.error("Upstream error %d: %s", upstream.status_code, error_text[:1000])
-                error_chunk = json.dumps(
-                    {
-                        "error": {
-                            "message": f"ChatGPT API error: {upstream.status_code}",
-                            "type": "upstream_error",
-                            "detail": error_text[:500],
-                        }
+        if upstream.status_code != 200:
+            error_parts = []
+            async for chunk in upstream.aiter_content():
+                error_parts.append(chunk.decode() if isinstance(chunk, bytes) else chunk)
+            error_text = "".join(error_parts)
+            log.error("Upstream error %d: %s", upstream.status_code, error_text[:1000])
+            error_chunk = json.dumps(
+                {
+                    "error": {
+                        "message": f"ChatGPT API error: {upstream.status_code}",
+                        "type": "upstream_error",
+                        "detail": error_text[:500],
                     }
-                )
-                await response.write(f"data: {error_chunk}\n\n".encode())
-                await response.write(b"data: [DONE]\n\n")
-                return response
+                }
+            )
+            await response.write(f"data: {error_chunk}\n\n".encode())
+            await response.write(b"data: [DONE]\n\n")
+            return response
 
-            # Process SSE stream from upstream
-            async for line_bytes in upstream.aiter_lines():
-                line = line_bytes.decode() if isinstance(line_bytes, bytes) else line_bytes
-                line = line.strip()
-                if not line:
-                    continue
-                if line.startswith("data: "):
-                    data_str = line[6:]
-                    if data_str == "[DONE]":
-                        await response.write(b"data: [DONE]\n\n")
-                        return response
-                    try:
-                        event_data = json.loads(data_str)
-                        event_type = event_data.get("type", "")
-                        sse_lines = translator.translate_event(event_type, event_data)
-                        for sse_line in sse_lines:
-                            await response.write(sse_line.encode())
-                    except json.JSONDecodeError:
-                        log.warning("Unparseable SSE data: %s", data_str[:200])
+        # Process SSE stream from upstream
+        async for line_bytes in upstream.aiter_lines():
+            line = line_bytes.decode() if isinstance(line_bytes, bytes) else line_bytes
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("data: "):
+                data_str = line[6:]
+                if data_str == "[DONE]":
+                    await response.write(b"data: [DONE]\n\n")
+                    return response
+                try:
+                    event_data = json.loads(data_str)
+                    event_type = event_data.get("type", "")
+                    sse_lines = translator.translate_event(event_type, event_data)
+                    for sse_line in sse_lines:
+                        await response.write(sse_line.encode())
+                except json.JSONDecodeError:
+                    log.warning("Unparseable SSE data: %s", data_str[:200])
 
     except Exception as e:
         log.error("Connection error: %s", e)
@@ -137,9 +135,24 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
     return response
 
 
+async def _create_upstream_session(app: web.Application) -> None:
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+    app["upstream_session"] = AsyncSession(
+        impersonate="chrome",
+        proxies={"https": proxy} if proxy else None,
+    )
+
+
+async def _close_upstream_session(app: web.Application) -> None:
+    session: AsyncSession = app["upstream_session"]
+    await session.close()
+
+
 def create_app() -> web.Application:
     """Create the aiohttp application."""
     app = web.Application()
+    app.on_startup.append(_create_upstream_session)
+    app.on_cleanup.append(_close_upstream_session)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/v1/models", handle_models)
     app.router.add_get("/models", handle_models)
