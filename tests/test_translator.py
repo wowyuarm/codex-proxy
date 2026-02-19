@@ -110,7 +110,7 @@ class TestChatToResponses:
         result = chat_to_responses(request)
         assert len(result["tools"]) == 1
         assert result["tools"][0]["name"] == "get_weather"
-        assert result["tools"][0]["strict"] is False
+        assert result["tools"][0]["strict"] is False  # default when not specified
 
     def test_temperature_and_max_tokens_stripped(self):
         request = {
@@ -122,6 +122,67 @@ class TestChatToResponses:
         result = chat_to_responses(request)
         assert "temperature" not in result
         assert "max_tokens" not in result
+
+    def test_multiple_system_messages_concatenated(self):
+        request = {
+            "model": "gpt-5.1",
+            "messages": [
+                {"role": "system", "content": "You are a coder."},
+                {"role": "system", "content": "Always use Python."},
+                {"role": "user", "content": "Hi"},
+            ],
+        }
+        result = chat_to_responses(request)
+        assert "You are a coder." in result["instructions"]
+        assert "Always use Python." in result["instructions"]
+
+    def test_assistant_content_and_tool_calls_both_preserved(self):
+        request = {
+            "model": "gpt-5.1",
+            "messages": [
+                {"role": "user", "content": "What's the weather?"},
+                {
+                    "role": "assistant",
+                    "content": "Let me check the weather for you.",
+                    "tool_calls": [
+                        {
+                            "id": "call_abc",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": '{"city": "Tokyo"}',
+                            },
+                        }
+                    ],
+                },
+            ],
+        }
+        result = chat_to_responses(request)
+        # Should have: user msg + assistant text msg + function_call = 3 items
+        assert len(result["input"]) == 3
+        assert result["input"][1]["type"] == "message"
+        assert result["input"][1]["content"][0]["text"] == "Let me check the weather for you."
+        assert result["input"][2]["type"] == "function_call"
+        assert result["input"][2]["name"] == "get_weather"
+
+    def test_tool_strict_forwarded(self):
+        request = {
+            "model": "gpt-5.1",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "fn",
+                        "description": "d",
+                        "parameters": {},
+                        "strict": True,
+                    },
+                }
+            ],
+        }
+        result = chat_to_responses(request)
+        assert result["tools"][0]["strict"] is True
 
     def test_multipart_content(self):
         request = {

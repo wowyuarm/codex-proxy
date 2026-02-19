@@ -67,7 +67,15 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
     response.headers["X-Accel-Buffering"] = "no"
     await response.prepare(request)
 
-    log.info("Upstream request body: %s", json.dumps(responses_body)[:2000])
+    tools_count = len(responses_body.get("tools", []))
+    log.info(
+        "Upstream request: model=%s, tools=%d, tool_choice=%s, input_items=%d",
+        responses_body.get("model"),
+        tools_count,
+        responses_body.get("tool_choice", "N/A"),
+        len(responses_body.get("input", [])),
+    )
+    log.debug("Upstream request body: %s", json.dumps(responses_body)[:5000])
 
     proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
     try:

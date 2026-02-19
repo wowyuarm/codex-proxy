@@ -1,9 +1,36 @@
 """Translate between OpenAI Chat Completions and ChatGPT Responses API formats."""
 
 import json
+import logging
 import time
 import uuid
 from typing import Any
+
+log = logging.getLogger(__name__)
+
+# Parameters that the Codex/Responses API does not support.
+# We log a warning when clients send these so failures are traceable.
+_UNSUPPORTED_PARAMS = {
+    "temperature",
+    "top_p",
+    "frequency_penalty",
+    "presence_penalty",
+    "max_tokens",
+    "max_completion_tokens",
+    "stop",
+    "response_format",
+    "logprobs",
+    "top_logprobs",
+    "seed",
+    "n",
+    "stream_options",
+    "user",
+    "modalities",
+    "audio",
+    "prediction",
+    "reasoning_effort",
+    "service_tier",
+}
 
 
 def chat_to_responses(request: dict[str, Any]) -> dict[str, Any]:
@@ -12,8 +39,13 @@ def chat_to_responses(request: dict[str, Any]) -> dict[str, Any]:
     Input: standard OpenAI /v1/chat/completions request
     Output: ChatGPT /backend-api/responses request body
     """
+    # Warn about unsupported parameters so clients can trace silent drops.
+    dropped = _UNSUPPORTED_PARAMS & request.keys()
+    if dropped:
+        log.warning("Dropping unsupported parameters: %s", ", ".join(sorted(dropped)))
+
     messages = request.get("messages", [])
-    instructions = None
+    system_parts: list[str] = []
     input_items: list[dict[str, Any]] = []
 
     for msg in messages:
@@ -21,8 +53,10 @@ def chat_to_responses(request: dict[str, Any]) -> dict[str, Any]:
         content = msg.get("content", "")
 
         if role == "system":
-            # System messages become 'instructions'
-            instructions = _extract_text(content)
+            # Collect all system messages; they are concatenated later.
+            text = _extract_text(content)
+            if text:
+                system_parts.append(text)
 
         elif role == "user":
             input_items.append(
@@ -34,8 +68,17 @@ def chat_to_responses(request: dict[str, Any]) -> dict[str, Any]:
 
         elif role == "assistant":
             tool_calls = msg.get("tool_calls")
+            # Preserve text content even when tool_calls coexist.
+            text = _extract_text(content)
+            if text:
+                input_items.append(
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": text}],
+                    }
+                )
             if tool_calls:
-                # Assistant with tool calls → function_call items
                 for tc in tool_calls:
                     fn = tc.get("function", {})
                     call_id = _normalize_tool_call_id(tc.get("id", ""))
@@ -46,17 +89,6 @@ def chat_to_responses(request: dict[str, Any]) -> dict[str, Any]:
                             "call_id": call_id,
                             "name": fn.get("name", ""),
                             "arguments": fn.get("arguments", ""),
-                        }
-                    )
-            else:
-                # Plain assistant message
-                text = _extract_text(content)
-                if text:
-                    input_items.append(
-                        {
-                            "type": "message",
-                            "role": "assistant",
-                            "content": [{"type": "output_text", "text": text}],
                         }
                     )
 
@@ -76,21 +108,22 @@ def chat_to_responses(request: dict[str, Any]) -> dict[str, Any]:
     if "/" in model:
         model = model.split("/", 1)[1]
 
+    instructions = "\n\n".join(system_parts) if system_parts else "You are a helpful assistant."
+
     body: dict[str, Any] = {
         "model": model,
         "stream": True,
         "store": False,
-        "instructions": instructions or "You are a helpful assistant.",
+        "instructions": instructions,
         "input": input_items,
         "include": ["reasoning.encrypted_content"],
-        "tool_choice": "auto",
-        "parallel_tool_calls": True,
     }
 
     if request.get("tools"):
         body["tools"] = _convert_tools(request["tools"])
-
-    # Note: temperature and max_tokens are not supported by the Codex API
+        # Only set tool_choice / parallel_tool_calls when tools are present
+        body["tool_choice"] = request.get("tool_choice", "auto")
+        body["parallel_tool_calls"] = request.get("parallel_tool_calls", True)
 
     return body
 
@@ -144,7 +177,7 @@ def _convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "name": fn.get("name", ""),
                     "description": fn.get("description", ""),
                     "parameters": fn.get("parameters", {}),
-                    "strict": False,
+                    "strict": fn.get("strict", False),
                 }
             )
     return result
