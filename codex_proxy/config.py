@@ -15,7 +15,7 @@ JWT_CLAIM_PATH = "https://api.openai.com/auth"
 
 # ChatGPT backend API
 CHATGPT_BACKEND_URL = "https://chatgpt.com/backend-api"
-RESPONSES_ENDPOINT = f"{CHATGPT_BACKEND_URL}/responses"
+RESPONSES_ENDPOINT = f"{CHATGPT_BACKEND_URL}/codex/responses"
 
 # Local storage
 CONFIG_DIR = Path.home() / ".codex-proxy"
@@ -25,10 +25,13 @@ CREDENTIALS_FILE = CONFIG_DIR / "credentials.json"
 DEFAULT_PORT = 8787
 DEFAULT_HOST = "127.0.0.1"
 
-# Available Codex models
+# Available Codex models (from pi-mono generate-models.ts)
 CODEX_MODELS = [
     {"id": "gpt-5.1", "object": "model", "owned_by": "openai"},
     {"id": "gpt-5.1-codex-max", "object": "model", "owned_by": "openai"},
     {"id": "gpt-5.1-codex-mini", "object": "model", "owned_by": "openai"},
+    {"id": "gpt-5.2", "object": "model", "owned_by": "openai"},
+    {"id": "gpt-5.2-codex", "object": "model", "owned_by": "openai"},
+    {"id": "gpt-5.3-codex", "object": "model", "owned_by": "openai"},
     {"id": "gpt-5.3-codex-spark", "object": "model", "owned_by": "openai"},
 ]

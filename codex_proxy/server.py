@@ -4,8 +4,8 @@ import json
 import logging
 import os
 
-import aiohttp
 from aiohttp import web
+from curl_cffi.requests import AsyncSession
 
 from codex_proxy.auth import ensure_credentials, extract_account_id
 from codex_proxy.config import CODEX_MODELS, RESPONSES_ENDPOINT
@@ -67,59 +67,55 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
     response.headers["X-Accel-Buffering"] = "no"
     await response.prepare(request)
 
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
     try:
-        proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
+        async with AsyncSession(impersonate="chrome") as session:
+            upstream = await session.post(
                 RESPONSES_ENDPOINT,
                 json=responses_body,
                 headers=headers,
-                proxy=proxy,
-            ) as upstream:
-                if upstream.status != 200:
-                    error_text = await upstream.text()
-                    log.error("Upstream error %d: %s", upstream.status, error_text[:500])
-                    error_chunk = json.dumps(
-                        {
-                            "error": {
-                                "message": f"ChatGPT API error: {upstream.status}",
-                                "type": "upstream_error",
-                                "detail": error_text[:500],
-                            }
+                proxies={"https": proxy} if proxy else None,
+                stream=True,
+                timeout=120,
+            )
+
+            if upstream.status_code != 200:
+                error_text = upstream.text
+                log.error("Upstream error %d: %s", upstream.status_code, error_text[:500])
+                error_chunk = json.dumps(
+                    {
+                        "error": {
+                            "message": f"ChatGPT API error: {upstream.status_code}",
+                            "type": "upstream_error",
+                            "detail": error_text[:500],
                         }
-                    )
-                    await response.write(f"data: {error_chunk}\n\n".encode())
-                    await response.write(b"data: [DONE]\n\n")
-                    return response
+                    }
+                )
+                await response.write(f"data: {error_chunk}\n\n".encode())
+                await response.write(b"data: [DONE]\n\n")
+                return response
 
-                # Process SSE stream from upstream
-                buffer = ""
-                async for chunk in upstream.content.iter_any():
-                    buffer += chunk.decode("utf-8", errors="replace")
-                    while "\n" in buffer:
-                        line, buffer = buffer.split("\n", 1)
-                        line = line.strip()
-                        if not line:
-                            continue
-                        if line.startswith("data: "):
-                            data_str = line[6:]
-                            if data_str == "[DONE]":
-                                # If we haven't sent our own [DONE], send it
-                                await response.write(b"data: [DONE]\n\n")
-                                return response
-                            try:
-                                event_data = json.loads(data_str)
-                                event_type = event_data.get("type", "")
-                                sse_lines = translator.translate_event(event_type, event_data)
-                                for sse_line in sse_lines:
-                                    await response.write(sse_line.encode())
-                            except json.JSONDecodeError:
-                                log.warning("Unparseable SSE data: %s", data_str[:200])
-                        elif line.startswith("event: "):
-                            # Some SSE streams use separate event: lines; we rely on type in data
-                            pass
+            # Process SSE stream from upstream
+            async for line_bytes in upstream.aiter_lines():
+                line = line_bytes.decode() if isinstance(line_bytes, bytes) else line_bytes
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("data: "):
+                    data_str = line[6:]
+                    if data_str == "[DONE]":
+                        await response.write(b"data: [DONE]\n\n")
+                        return response
+                    try:
+                        event_data = json.loads(data_str)
+                        event_type = event_data.get("type", "")
+                        sse_lines = translator.translate_event(event_type, event_data)
+                        for sse_line in sse_lines:
+                            await response.write(sse_line.encode())
+                    except json.JSONDecodeError:
+                        log.warning("Unparseable SSE data: %s", data_str[:200])
 
-    except aiohttp.ClientError as e:
+    except Exception as e:
         log.error("Connection error: %s", e)
         error_chunk = json.dumps({"error": {"message": str(e), "type": "connection_error"}})
         await response.write(f"data: {error_chunk}\n\n".encode())

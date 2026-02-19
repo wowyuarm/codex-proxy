@@ -75,14 +75,12 @@ def chat_to_responses(request: dict[str, Any]) -> dict[str, Any]:
         "model": request.get("model", "gpt-5.1"),
         "stream": True,
         "store": False,
+        "instructions": instructions or "You are a helpful assistant.",
         "input": input_items,
         "include": ["reasoning.encrypted_content"],
         "tool_choice": "auto",
         "parallel_tool_calls": True,
     }
-
-    if instructions:
-        body["instructions"] = instructions
 
     if request.get("tools"):
         body["tools"] = _convert_tools(request["tools"])

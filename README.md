@@ -3,7 +3,7 @@
 Local proxy that exposes ChatGPT Codex models as an OpenAI-compatible API, using your ChatGPT Plus/Pro subscription quota.
 
 ```
-Client (HaL, CLINE, curl, ...) ──POST /v1/chat/completions──▶ codex-proxy ──▶ chatgpt.com/backend-api/responses
+Client (HaL, CLINE, curl, ...) ──POST /v1/chat/completions──▶ codex-proxy ──▶ chatgpt.com/backend-api/codex/responses
          ◀── OpenAI SSE ──────────────────────────────────────────────────◀── Responses API SSE
 ```
 
@@ -40,7 +40,6 @@ codex-proxy serve    # proxy used for upstream API calls
 Once the proxy is running, point any OpenAI-compatible client at it:
 
 ```bash
-# curl
 curl http://localhost:8787/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"gpt-5.1","messages":[{"role":"user","content":"Hello!"}],"stream":true}'
@@ -51,6 +50,9 @@ curl http://localhost:8787/v1/chat/completions \
 - `gpt-5.1`
 - `gpt-5.1-codex-max`
 - `gpt-5.1-codex-mini`
+- `gpt-5.2`
+- `gpt-5.2-codex`
+- `gpt-5.3-codex`
 - `gpt-5.3-codex-spark`
 
 ### Endpoints
@@ -61,29 +63,43 @@ curl http://localhost:8787/v1/chat/completions \
 | GET | `/v1/models` | List available models |
 | GET | `/health` | Health check |
 
-## Integration with HaL
+## Integration Guide
 
-In `~/.hal/config.json`, add codex-proxy as a provider:
+codex-proxy exposes a standard OpenAI-compatible API at `http://localhost:8787/v1`. Any tool that supports a custom OpenAI base URL can use it directly — just point it at the proxy and set `api_key` to any non-empty string (auth is handled internally by the proxy).
 
-```json
-{
-  "providers": {
-    "vllm": {
-      "api_key": "unused",
-      "api_base": "http://localhost:8787"
-    }
-  }
-}
+### LiteLLM (used by HaL and many other tools)
+
+```python
+import litellm
+
+response = litellm.completion(
+    model="openai/gpt-5.1",
+    messages=[{"role": "user", "content": "Hello!"}],
+    api_base="http://localhost:8787",
+    api_key="codex-proxy",
+    stream=True,
+)
+for chunk in response:
+    print(chunk.choices[0].delta.content or "", end="")
 ```
 
-Then use any Codex model name (e.g. `gpt-5.1`) in HaL.
+### General Pattern
+
+For any OpenAI-compatible client, configure:
+
+| Setting | Value |
+|---------|-------|
+| Base URL | `http://localhost:8787/v1` (or `http://localhost:8787`) |
+| API Key | Any non-empty string (e.g. `codex-proxy`) |
+| Model | `gpt-5.1` (or any model from the list above) |
 
 ## How It Works
 
 1. **OAuth PKCE** — `codex-proxy login` runs a standard OAuth 2.0 + PKCE flow against `auth.openai.com`, storing tokens in `~/.codex-proxy/credentials.json`
 2. **Token auto-refresh** — expired tokens are automatically refreshed using the stored refresh token
-3. **Request translation** — OpenAI Chat Completions format is converted to ChatGPT Responses API format
-4. **Response translation** — Responses API SSE events are translated back to OpenAI Chat Completions SSE chunks (including tool calls and usage)
+3. **TLS fingerprint** — uses `curl_cffi` with Chrome impersonation to bypass Cloudflare bot detection
+4. **Request translation** — OpenAI Chat Completions format is converted to ChatGPT Responses API format
+5. **Response translation** — Responses API SSE events are translated back to OpenAI Chat Completions SSE chunks (including tool calls and usage)
 
 ## Disclaimer
 
