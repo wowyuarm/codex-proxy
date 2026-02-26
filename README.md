@@ -60,6 +60,7 @@ curl http://localhost:8787/v1/chat/completions \
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/v1/chat/completions` | Chat completions (streaming) |
+| POST | `/v1/responses` | Responses API (streaming/non-streaming) |
 | GET | `/v1/models` | List available models |
 | GET | `/health` | Health check |
 
@@ -81,6 +82,18 @@ response = litellm.completion(
 )
 for chunk in response:
     print(chunk.choices[0].delta.content or "", end="")
+```
+
+If LiteLLM routes Codex-family calls to the Responses API, this proxy also supports:
+
+```python
+response = litellm.responses(
+    model="openai/gpt-5.1-codex",
+    input="Hello!",
+    api_base="http://localhost:8787",
+    api_key="codex-proxy",
+    stream=True,
+)
 ```
 
 ### General Pattern

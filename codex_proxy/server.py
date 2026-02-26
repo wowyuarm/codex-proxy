@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+from typing import Any
 
 from aiohttp import web
 from curl_cffi.requests import AsyncSession
@@ -30,6 +31,33 @@ async def handle_models(request: web.Request) -> web.Response:
     )
 
 
+def _build_upstream_headers(credentials: dict[str, Any], accept: str) -> dict[str, str]:
+    """Build auth headers for ChatGPT backend requests."""
+    access_token = credentials["access_token"]
+    account_id = credentials.get("account_id") or extract_account_id(access_token)
+    return {
+        "Authorization": f"Bearer {access_token}",
+        "chatgpt-account-id": account_id,
+        "OpenAI-Beta": "responses=experimental",
+        "Content-Type": "application/json",
+        "Accept": accept,
+    }
+
+
+async def _read_upstream_text(upstream: Any) -> str:
+    """Read full upstream response body as text."""
+    try:
+        chunks = []
+        async for chunk in upstream.aiter_content():
+            chunks.append(chunk.decode(errors="replace") if isinstance(chunk, bytes) else chunk)
+        return "".join(chunks)
+    except Exception:
+        text = getattr(upstream, "text", "")
+        if isinstance(text, bytes):
+            return text.decode(errors="replace")
+        return str(text)
+
+
 async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
     """Main proxy endpoint: translate and forward to ChatGPT backend."""
     try:
@@ -48,15 +76,7 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
     responses_body = chat_to_responses(body)
 
     # Build headers for ChatGPT backend
-    access_token = credentials["access_token"]
-    account_id = credentials.get("account_id") or extract_account_id(access_token)
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "chatgpt-account-id": account_id,
-        "OpenAI-Beta": "responses=experimental",
-        "Content-Type": "application/json",
-        "Accept": "text/event-stream",
-    }
+    headers = _build_upstream_headers(credentials, accept="text/event-stream")
 
     # Forward to ChatGPT backend
     translator = ResponseStreamTranslator(model)
@@ -88,10 +108,7 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
         )
 
         if upstream.status_code != 200:
-            error_parts = []
-            async for chunk in upstream.aiter_content():
-                error_parts.append(chunk.decode() if isinstance(chunk, bytes) else chunk)
-            error_text = "".join(error_parts)
+            error_text = await _read_upstream_text(upstream)
             log.error("Upstream error %d: %s", upstream.status_code, error_text[:1000])
             error_chunk = json.dumps(
                 {
@@ -135,6 +152,128 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
     return response
 
 
+async def handle_responses(request: web.Request) -> web.StreamResponse | web.Response:
+    """Forward OpenAI Responses API requests directly to ChatGPT backend."""
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    # ChatGPT Codex responses endpoint requires instructions.
+    # Add a sensible default for OpenAI-compatible clients that omit it.
+    if not body.get("instructions"):
+        body = dict(body)
+        body["instructions"] = "You are a helpful assistant."
+
+    if body.get("store") is not False:
+        body = dict(body)
+        body["store"] = False
+
+    # OpenAI Responses API allows input as a plain string.
+    # Normalize to ChatGPT Codex format that expects a list of input items.
+    input_value = body.get("input")
+    if isinstance(input_value, str):
+        body = dict(body)
+        body["input"] = [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": input_value}],
+            }
+        ]
+
+    try:
+        credentials = await ensure_credentials()
+    except RuntimeError as e:
+        return web.json_response({"error": str(e)}, status=401)
+
+    client_stream = bool(body.get("stream"))
+    body = dict(body)
+    # ChatGPT Codex responses endpoint currently enforces stream=true.
+    # For client stream=false, we aggregate upstream SSE into a final JSON response.
+    body["stream"] = True
+    headers = _build_upstream_headers(
+        credentials,
+        accept="text/event-stream",
+    )
+
+    log.info(
+        "Upstream /responses request: model=%s, stream=%s, input_items=%d",
+        body.get("model"),
+        client_stream,
+        len(body.get("input", [])) if isinstance(body.get("input"), list) else 0,
+    )
+    log.debug("Upstream /responses request body: %s", json.dumps(body)[:5000])
+
+    try:
+        session: AsyncSession = request.app["upstream_session"]
+        upstream = await session.post(
+            RESPONSES_ENDPOINT,
+            json=body,
+            headers=headers,
+            stream=True,
+            timeout=120,
+        )
+
+        if upstream.status_code != 200:
+            error_text = await _read_upstream_text(upstream)
+            log.error("Upstream /responses error %d: %s", upstream.status_code, error_text[:1000])
+            try:
+                return web.json_response(json.loads(error_text), status=upstream.status_code)
+            except json.JSONDecodeError:
+                return web.Response(text=error_text, status=upstream.status_code)
+
+        if client_stream:
+            response = web.StreamResponse()
+            response.content_type = "text/event-stream"
+            response.headers["Cache-Control"] = "no-cache"
+            response.headers["Connection"] = "keep-alive"
+            response.headers["X-Accel-Buffering"] = "no"
+            await response.prepare(request)
+
+            async for chunk in upstream.aiter_content():
+                await response.write(chunk if isinstance(chunk, bytes) else chunk.encode())
+            return response
+
+        completed_response: dict[str, Any] | None = None
+        async for line_bytes in upstream.aiter_lines():
+            line = line_bytes.decode() if isinstance(line_bytes, bytes) else line_bytes
+            line = line.strip()
+            if not line or not line.startswith("data: "):
+                continue
+
+            data_str = line[6:]
+            if data_str == "[DONE]":
+                break
+
+            try:
+                event_data = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+
+            event_type = event_data.get("type", "")
+            if event_type == "response.completed":
+                response_obj = event_data.get("response")
+                if isinstance(response_obj, dict):
+                    completed_response = response_obj
+            elif event_type in {"error", "response.failed"}:
+                return web.json_response(event_data, status=502)
+
+        if completed_response is not None:
+            return web.json_response(completed_response, status=200)
+
+        return web.json_response(
+            {"error": {"message": "Missing response.completed event", "type": "upstream_error"}},
+            status=502,
+        )
+
+    except Exception as e:
+        log.error("Connection error on /responses: %s", e)
+        return web.json_response(
+            {"error": {"message": str(e), "type": "connection_error"}},
+            status=502,
+        )
+
+
 async def _create_upstream_session(app: web.Application) -> None:
     proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
     app["upstream_session"] = AsyncSession(
@@ -158,6 +297,8 @@ def create_app() -> web.Application:
     app.router.add_get("/models", handle_models)
     app.router.add_post("/v1/chat/completions", handle_chat_completions)
     app.router.add_post("/chat/completions", handle_chat_completions)
+    app.router.add_post("/v1/responses", handle_responses)
+    app.router.add_post("/responses", handle_responses)
     return app
 
 
@@ -169,5 +310,7 @@ def run_server(host: str, port: int) -> None:
     )
     app = create_app()
     log.info("Starting codex-proxy on %s:%d", host, port)
-    log.info("Endpoints: POST /v1/chat/completions, GET /v1/models, GET /health")
+    log.info(
+        "Endpoints: POST /v1/chat/completions, POST /v1/responses, GET /v1/models, GET /health"
+    )
     web.run_app(app, host=host, port=port, print=None)
