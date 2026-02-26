@@ -19,6 +19,54 @@ log = logging.getLogger(__name__)
 _UNSUPPORTED_RESPONSES_PARAMS = {"max_output_tokens"}
 
 
+def _normalize_responses_tools(tools: Any) -> Any:
+    """Accept both Chat Completions and Responses tools schema on /responses."""
+    if not isinstance(tools, list):
+        return tools
+
+    converted_count = 0
+    normalized_tools: list[Any] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            normalized_tools.append(tool)
+            continue
+
+        fn = tool.get("function")
+        if tool.get("type") == "function" and isinstance(fn, dict):
+            normalized_tools.append(
+                {
+                    "type": "function",
+                    "name": fn.get("name", ""),
+                    "description": fn.get("description", ""),
+                    "parameters": fn.get("parameters", {}),
+                    "strict": fn.get("strict", False),
+                }
+            )
+            converted_count += 1
+            continue
+
+        normalized_tools.append(tool)
+
+    if converted_count:
+        log.info("Normalized %d chat-style tools on /responses", converted_count)
+    return normalized_tools
+
+
+def _normalize_responses_tool_choice(tool_choice: Any) -> Any:
+    """Normalize chat.completions-style tool_choice for /responses."""
+    if not isinstance(tool_choice, dict):
+        return tool_choice
+
+    fn = tool_choice.get("function")
+    if tool_choice.get("type") == "function" and isinstance(fn, dict):
+        return {
+            "type": "function",
+            "name": fn.get("name", ""),
+        }
+
+    return tool_choice
+
+
 async def handle_health(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok"})
 
@@ -88,6 +136,11 @@ def _normalize_responses_body(raw_body: dict[str, Any]) -> tuple[dict[str, Any],
                 "content": [{"type": "input_text", "text": input_value}],
             }
         ]
+
+    if "tools" in body:
+        body["tools"] = _normalize_responses_tools(body.get("tools"))
+    if "tool_choice" in body:
+        body["tool_choice"] = _normalize_responses_tool_choice(body.get("tool_choice"))
 
     # ChatGPT Codex responses endpoint currently enforces stream=true.
     # For client stream=false, we aggregate upstream SSE into a final JSON response.

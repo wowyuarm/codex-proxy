@@ -56,3 +56,67 @@ def test_normalize_responses_body_keeps_existing_values():
     assert body["instructions"] == "Custom instruction"
     assert body["store"] is False
     assert body["stream"] is True
+
+
+def test_normalize_responses_body_converts_chat_style_tools_and_tool_choice():
+    body, _ = _normalize_responses_body(
+        {
+            "model": "gpt-5.3-codex",
+            "input": "hi",
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "search_docs",
+                        "description": "Search docs",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+            "tool_choice": {
+                "type": "function",
+                "function": {"name": "search_docs"},
+            },
+        }
+    )
+
+    assert body["tools"] == [
+        {
+            "type": "function",
+            "name": "search_docs",
+            "description": "Search docs",
+            "parameters": {"type": "object", "properties": {}},
+            "strict": False,
+        }
+    ]
+    assert body["tool_choice"] == {"type": "function", "name": "search_docs"}
+
+
+def test_normalize_responses_body_keeps_responses_style_tools_unchanged():
+    body, _ = _normalize_responses_body(
+        {
+            "model": "gpt-5.3-codex",
+            "input": "hi",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "search_docs",
+                    "description": "Search docs",
+                    "parameters": {"type": "object"},
+                    "strict": True,
+                }
+            ],
+            "tool_choice": {"type": "function", "name": "search_docs"},
+        }
+    )
+
+    assert body["tools"] == [
+        {
+            "type": "function",
+            "name": "search_docs",
+            "description": "Search docs",
+            "parameters": {"type": "object"},
+            "strict": True,
+        }
+    ]
+    assert body["tool_choice"] == {"type": "function", "name": "search_docs"}
