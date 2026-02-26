@@ -16,7 +16,70 @@ from codex_proxy.translator import (
 )
 
 log = logging.getLogger(__name__)
-_UNSUPPORTED_RESPONSES_PARAMS = {"max_output_tokens"}
+_UNSUPPORTED_RESPONSES_PARAMS = {
+    "max_output_tokens",
+    "max_tokens",
+    "max_completion_tokens",
+}
+
+
+def _normalize_tool_strict(value: Any) -> bool:
+    """Normalize tool strictness to a boolean value."""
+    return value if isinstance(value, bool) else False
+
+
+def _normalize_input_content(content: Any) -> Any:
+    """Normalize message content parts for ChatGPT codex upstream."""
+    if isinstance(content, str):
+        return [{"type": "input_text", "text": content}]
+    if not isinstance(content, list):
+        return content
+
+    normalized: list[Any] = []
+    for part in content:
+        if isinstance(part, dict) and part.get("type") == "text":
+            normalized.append({"type": "input_text", "text": part.get("text", "")})
+        else:
+            normalized.append(part)
+    return normalized
+
+
+def _normalize_responses_input(input_value: Any) -> Any:
+    """Normalize /responses input items from OpenAI-style payloads."""
+    if isinstance(input_value, str):
+        return [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": input_value}],
+            }
+        ]
+    if not isinstance(input_value, list):
+        return input_value
+
+    normalized: list[Any] = []
+    converted = 0
+    for item in input_value:
+        if not isinstance(item, dict):
+            normalized.append(item)
+            continue
+
+        if item.get("type") == "message":
+            converted += 1
+            new_item = dict(item)
+            new_item.pop("type", None)
+            if "content" in new_item:
+                new_item["content"] = _normalize_input_content(new_item["content"])
+            normalized.append(new_item)
+            continue
+
+        new_item = dict(item)
+        if "content" in new_item:
+            new_item["content"] = _normalize_input_content(new_item["content"])
+        normalized.append(new_item)
+
+    if converted:
+        log.info("Normalized %d OpenAI-style input message items on /responses", converted)
+    return normalized
 
 
 def _normalize_responses_tools(tools: Any) -> Any:
@@ -39,10 +102,16 @@ def _normalize_responses_tools(tools: Any) -> Any:
                     "name": fn.get("name", ""),
                     "description": fn.get("description", ""),
                     "parameters": fn.get("parameters", {}),
-                    "strict": fn.get("strict", False),
+                    "strict": _normalize_tool_strict(fn.get("strict")),
                 }
             )
             converted_count += 1
+            continue
+
+        if tool.get("type") == "function":
+            direct = dict(tool)
+            direct["strict"] = _normalize_tool_strict(direct.get("strict"))
+            normalized_tools.append(direct)
             continue
 
         normalized_tools.append(tool)
@@ -128,14 +197,8 @@ def _normalize_responses_body(raw_body: dict[str, Any]) -> tuple[dict[str, Any],
 
     # OpenAI Responses API allows input as a plain string.
     # Normalize to ChatGPT Codex format that expects a list of input items.
-    input_value = body.get("input")
-    if isinstance(input_value, str):
-        body["input"] = [
-            {
-                "role": "user",
-                "content": [{"type": "input_text", "text": input_value}],
-            }
-        ]
+    if "input" in body:
+        body["input"] = _normalize_responses_input(body.get("input"))
 
     if "tools" in body:
         body["tools"] = _normalize_responses_tools(body.get("tools"))

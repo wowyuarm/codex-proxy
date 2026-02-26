@@ -29,11 +29,13 @@ def test_normalize_responses_body_drops_max_output_tokens_and_sets_defaults():
             "model": "gpt-5.3-codex",
             "input": "hi",
             "max_output_tokens": 256,
+            "max_completion_tokens": 123,
             "stream": False,
         }
     )
     assert client_stream is False
     assert "max_output_tokens" not in body
+    assert "max_completion_tokens" not in body
     assert body["instructions"] == "You are a helpful assistant."
     assert body["store"] is False
     assert body["stream"] is True
@@ -120,3 +122,52 @@ def test_normalize_responses_body_keeps_responses_style_tools_unchanged():
         }
     ]
     assert body["tool_choice"] == {"type": "function", "name": "search_docs"}
+
+
+def test_normalize_responses_body_normalizes_litellm_input_and_strict_null():
+    body, _ = _normalize_responses_body(
+        {
+            "model": "gpt-5.3-codex",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hi"}],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "hello"}],
+                },
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "search_docs",
+                    "description": "Search docs",
+                    "parameters": {"type": "object"},
+                    "strict": None,
+                }
+            ],
+        }
+    )
+
+    assert body["input"] == [
+        {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hi"}],
+        },
+        {
+            "role": "assistant",
+            "content": [{"type": "input_text", "text": "hello"}],
+        },
+    ]
+    assert body["tools"] == [
+        {
+            "type": "function",
+            "name": "search_docs",
+            "description": "Search docs",
+            "parameters": {"type": "object"},
+            "strict": False,
+        }
+    ]

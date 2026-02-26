@@ -96,6 +96,8 @@ response = litellm.responses(
 )
 ```
 
+`/v1/responses` includes LiteLLM compatibility normalization for common payload variants such as `max_output_tokens`, chat-style `tools`/`tool_choice`, and OpenAI-style `input` message items.
+
 ### General Pattern
 
 For any OpenAI-compatible client, configure:
