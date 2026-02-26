@@ -16,6 +16,7 @@ from codex_proxy.translator import (
 )
 
 log = logging.getLogger(__name__)
+_UNSUPPORTED_RESPONSES_PARAMS = {"max_output_tokens"}
 
 
 async def handle_health(request: web.Request) -> web.Response:
@@ -56,6 +57,42 @@ async def _read_upstream_text(upstream: Any) -> str:
         if isinstance(text, bytes):
             return text.decode(errors="replace")
         return str(text)
+
+
+def _normalize_responses_body(raw_body: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Normalize OpenAI-style /responses request for ChatGPT codex upstream."""
+    body = dict(raw_body)
+    client_stream = bool(body.get("stream"))
+
+    dropped = _UNSUPPORTED_RESPONSES_PARAMS & body.keys()
+    for key in dropped:
+        body.pop(key, None)
+    if dropped:
+        log.warning("Dropping unsupported /responses parameters: %s", ", ".join(sorted(dropped)))
+
+    # ChatGPT Codex responses endpoint requires instructions.
+    # Add a sensible default for OpenAI-compatible clients that omit it.
+    if not body.get("instructions"):
+        body["instructions"] = "You are a helpful assistant."
+
+    if body.get("store") is not False:
+        body["store"] = False
+
+    # OpenAI Responses API allows input as a plain string.
+    # Normalize to ChatGPT Codex format that expects a list of input items.
+    input_value = body.get("input")
+    if isinstance(input_value, str):
+        body["input"] = [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": input_value}],
+            }
+        ]
+
+    # ChatGPT Codex responses endpoint currently enforces stream=true.
+    # For client stream=false, we aggregate upstream SSE into a final JSON response.
+    body["stream"] = True
+    return body, client_stream
 
 
 async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
@@ -158,39 +195,13 @@ async def handle_responses(request: web.Request) -> web.StreamResponse | web.Res
         body = await request.json()
     except json.JSONDecodeError:
         return web.json_response({"error": "Invalid JSON"}, status=400)
-
-    # ChatGPT Codex responses endpoint requires instructions.
-    # Add a sensible default for OpenAI-compatible clients that omit it.
-    if not body.get("instructions"):
-        body = dict(body)
-        body["instructions"] = "You are a helpful assistant."
-
-    if body.get("store") is not False:
-        body = dict(body)
-        body["store"] = False
-
-    # OpenAI Responses API allows input as a plain string.
-    # Normalize to ChatGPT Codex format that expects a list of input items.
-    input_value = body.get("input")
-    if isinstance(input_value, str):
-        body = dict(body)
-        body["input"] = [
-            {
-                "role": "user",
-                "content": [{"type": "input_text", "text": input_value}],
-            }
-        ]
+    body, client_stream = _normalize_responses_body(body)
 
     try:
         credentials = await ensure_credentials()
     except RuntimeError as e:
         return web.json_response({"error": str(e)}, status=401)
 
-    client_stream = bool(body.get("stream"))
-    body = dict(body)
-    # ChatGPT Codex responses endpoint currently enforces stream=true.
-    # For client stream=false, we aggregate upstream SSE into a final JSON response.
-    body["stream"] = True
     headers = _build_upstream_headers(
         credentials,
         accept="text/event-stream",
