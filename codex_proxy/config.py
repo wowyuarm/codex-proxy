@@ -23,7 +23,7 @@ CREDENTIALS_FILE = CONFIG_DIR / "credentials.json"
 
 # Server defaults
 DEFAULT_PORT = 8787
-DEFAULT_HOST = "127.0.0.1"
+DEFAULT_HOST = "0.0.0.0"
 
 # Available Codex models (from pi-mono generate-models.ts)
 CODEX_MODELS = [

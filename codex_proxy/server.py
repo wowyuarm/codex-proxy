@@ -16,6 +16,33 @@ from codex_proxy.translator import (
 )
 
 log = logging.getLogger(__name__)
+
+# --- API key authentication middleware ---
+_API_KEY = os.environ.get("CODEX_PROXY_API_KEY")
+_PUBLIC_PATHS = {"/health"}
+
+
+@web.middleware
+async def api_key_middleware(request: web.Request, handler):
+    """Reject requests without a valid API key (if CODEX_PROXY_API_KEY is set)."""
+    if not _API_KEY or request.path in _PUBLIC_PATHS:
+        return await handler(request)
+
+    auth = request.headers.get("Authorization", "")
+    api_key_header = request.headers.get("X-API-Key", "")
+
+    provided = None
+    if auth.startswith("Bearer "):
+        provided = auth[7:]
+    elif api_key_header:
+        provided = api_key_header
+
+    if provided != _API_KEY:
+        return web.json_response(
+            {"error": {"message": "Invalid or missing API key", "type": "auth_error"}},
+            status=401,
+        )
+    return await handler(request)
 _UNSUPPORTED_RESPONSES_PARAMS = {
     "max_output_tokens",
     "max_tokens",
@@ -421,7 +448,12 @@ async def _close_upstream_session(app: web.Application) -> None:
 
 def create_app() -> web.Application:
     """Create the aiohttp application."""
-    app = web.Application()
+    middlewares = [api_key_middleware] if _API_KEY else []
+    if _API_KEY:
+        log.info("API key authentication enabled")
+    else:
+        log.warning("No CODEX_PROXY_API_KEY set — running without authentication")
+    app = web.Application(middlewares=middlewares)
     app.on_startup.append(_create_upstream_session)
     app.on_cleanup.append(_close_upstream_session)
     app.router.add_get("/health", handle_health)
