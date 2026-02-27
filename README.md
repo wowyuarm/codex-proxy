@@ -91,7 +91,7 @@ curl http://localhost:8787/v1/chat/completions \
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/v1/chat/completions` | Chat completions (streaming) |
+| POST | `/v1/chat/completions` | Chat completions (streaming and non-streaming) |
 | POST | `/v1/responses` | Responses API (streaming/non-streaming) |
 | GET | `/v1/models` | List available models |
 | GET | `/health` | Health check (no auth required) |

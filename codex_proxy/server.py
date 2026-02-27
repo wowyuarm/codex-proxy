@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import time
 from typing import Any
 
 from aiohttp import web
@@ -243,7 +244,163 @@ def _normalize_responses_body(raw_body: dict[str, Any]) -> tuple[dict[str, Any],
     return body, client_stream
 
 
-async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
+def _parse_sse_data_line(line: str) -> str | None:
+    """Extract payload from one SSE `data:` line."""
+    stripped = line.strip()
+    if not stripped.startswith("data: "):
+        return None
+    return stripped[6:]
+
+
+def _merge_tool_call_delta(tool_calls_by_index: dict[int, dict[str, Any]], delta_calls: Any) -> None:
+    """Merge streamed tool_call deltas into indexed tool call state."""
+    if not isinstance(delta_calls, list):
+        return
+
+    for call in delta_calls:
+        if not isinstance(call, dict):
+            continue
+        index = call.get("index")
+        if not isinstance(index, int):
+            continue
+
+        state = tool_calls_by_index.setdefault(
+            index,
+            {
+                "id": "",
+                "type": "function",
+                "function": {"name": "", "arguments": ""},
+            },
+        )
+
+        call_id = call.get("id")
+        if isinstance(call_id, str) and call_id:
+            state["id"] = call_id
+
+        call_type = call.get("type")
+        if isinstance(call_type, str) and call_type:
+            state["type"] = call_type
+
+        fn_delta = call.get("function")
+        if not isinstance(fn_delta, dict):
+            continue
+
+        fn_state = state["function"]
+        fn_name = fn_delta.get("name")
+        if isinstance(fn_name, str) and fn_name:
+            fn_state["name"] = fn_name
+
+        fn_args = fn_delta.get("arguments")
+        if isinstance(fn_args, str) and fn_args:
+            fn_state["arguments"] = f"{fn_state['arguments']}{fn_args}"
+
+
+def _aggregate_nonstream_chat_completion(chunks: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Build one OpenAI Chat Completions JSON response from streaming chunks."""
+    if not chunks:
+        return None
+
+    response_id: str | None = None
+    model: str | None = None
+    created: int | None = None
+    usage: dict[str, Any] | None = None
+    role: str | None = None
+    finish_reason: str | None = None
+    content_parts: list[str] = []
+    tool_calls_by_index: dict[int, dict[str, Any]] = {}
+
+    for chunk in chunks:
+        if response_id is None:
+            chunk_id = chunk.get("id")
+            if isinstance(chunk_id, str) and chunk_id:
+                response_id = chunk_id
+
+        if model is None:
+            chunk_model = chunk.get("model")
+            if isinstance(chunk_model, str) and chunk_model:
+                model = chunk_model
+
+        if created is None:
+            chunk_created = chunk.get("created")
+            if isinstance(chunk_created, int):
+                created = chunk_created
+
+        chunk_usage = chunk.get("usage")
+        if isinstance(chunk_usage, dict):
+            usage = chunk_usage
+
+        choices = chunk.get("choices")
+        if not isinstance(choices, list) or not choices:
+            continue
+
+        choice0 = choices[0]
+        if not isinstance(choice0, dict):
+            continue
+
+        chunk_finish_reason = choice0.get("finish_reason")
+        if isinstance(chunk_finish_reason, str):
+            finish_reason = chunk_finish_reason
+
+        delta = choice0.get("delta")
+        if not isinstance(delta, dict):
+            continue
+
+        delta_role = delta.get("role")
+        if isinstance(delta_role, str) and delta_role:
+            role = delta_role
+
+        delta_content = delta.get("content")
+        if isinstance(delta_content, str):
+            content_parts.append(delta_content)
+
+        _merge_tool_call_delta(tool_calls_by_index, delta.get("tool_calls"))
+
+    tool_calls: list[dict[str, Any]] = []
+    for index in sorted(tool_calls_by_index):
+        state = tool_calls_by_index[index]
+        fn_state = state["function"]
+        tool_calls.append(
+            {
+                "id": state["id"] or f"call_{index}",
+                "type": state["type"] or "function",
+                "function": {
+                    "name": fn_state["name"] or "",
+                    "arguments": fn_state["arguments"] or "",
+                },
+            }
+        )
+
+    content = "".join(content_parts)
+    message: dict[str, Any] = {"role": role or "assistant"}
+    if tool_calls:
+        message["content"] = content or None
+        message["tool_calls"] = tool_calls
+        if finish_reason is None:
+            finish_reason = "tool_calls"
+    else:
+        message["content"] = content
+        if finish_reason is None:
+            finish_reason = "stop"
+
+    completion: dict[str, Any] = {
+        "id": response_id or "chatcmpl-proxy",
+        "object": "chat.completion",
+        "created": created if created is not None else int(time.time()),
+        "model": model or "",
+        "choices": [
+            {
+                "index": 0,
+                "message": message,
+                "finish_reason": finish_reason,
+            }
+        ],
+    }
+    if usage is not None:
+        completion["usage"] = usage
+    return completion
+
+
+async def handle_chat_completions(request: web.Request) -> web.StreamResponse | web.Response:
     """Main proxy endpoint: translate and forward to ChatGPT backend."""
     try:
         body = await request.json()
@@ -257,6 +414,7 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
         return web.json_response({"error": str(e)}, status=401)
 
     # Translate request
+    client_stream = bool(body.get("stream"))
     model = body.get("model", "gpt-5.1")
     responses_body = chat_to_responses(body)
 
@@ -265,12 +423,14 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
 
     # Forward to ChatGPT backend
     translator = ResponseStreamTranslator(model)
-    response = web.StreamResponse()
-    response.content_type = "text/event-stream"
-    response.headers["Cache-Control"] = "no-cache"
-    response.headers["Connection"] = "keep-alive"
-    response.headers["X-Accel-Buffering"] = "no"
-    await response.prepare(request)
+    response: web.StreamResponse | None = None
+    if client_stream:
+        response = web.StreamResponse()
+        response.content_type = "text/event-stream"
+        response.headers["Cache-Control"] = "no-cache"
+        response.headers["Connection"] = "keep-alive"
+        response.headers["X-Accel-Buffering"] = "no"
+        await response.prepare(request)
 
     tools_count = len(responses_body.get("tools", []))
     log.info(
@@ -295,46 +455,111 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
         if upstream.status_code != 200:
             error_text = await _read_upstream_text(upstream)
             log.error("Upstream error %d: %s", upstream.status_code, error_text[:1000])
-            error_chunk = json.dumps(
+            if client_stream and response is not None:
+                error_chunk = json.dumps(
+                    {
+                        "error": {
+                            "message": f"ChatGPT API error: {upstream.status_code}",
+                            "type": "upstream_error",
+                            "detail": error_text[:500],
+                        }
+                    }
+                )
+                await response.write(f"data: {error_chunk}\n\n".encode())
+                await response.write(b"data: [DONE]\n\n")
+                return response
+            return web.json_response(
                 {
                     "error": {
                         "message": f"ChatGPT API error: {upstream.status_code}",
                         "type": "upstream_error",
                         "detail": error_text[:500],
                     }
-                }
+                },
+                status=upstream.status_code,
             )
-            await response.write(f"data: {error_chunk}\n\n".encode())
-            await response.write(b"data: [DONE]\n\n")
+
+        if client_stream and response is not None:
+            # Process SSE stream from upstream
+            async for line_bytes in upstream.aiter_lines():
+                line = line_bytes.decode() if isinstance(line_bytes, bytes) else line_bytes
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("data: "):
+                    data_str = line[6:]
+                    if data_str == "[DONE]":
+                        await response.write(b"data: [DONE]\n\n")
+                        return response
+                    try:
+                        event_data = json.loads(data_str)
+                        event_type = event_data.get("type", "")
+                        sse_lines = translator.translate_event(event_type, event_data)
+                        for sse_line in sse_lines:
+                            await response.write(sse_line.encode())
+                    except json.JSONDecodeError:
+                        log.warning("Unparseable SSE data: %s", data_str[:200])
             return response
 
-        # Process SSE stream from upstream
+        translated_chunks: list[dict[str, Any]] = []
         async for line_bytes in upstream.aiter_lines():
             line = line_bytes.decode() if isinstance(line_bytes, bytes) else line_bytes
             line = line.strip()
             if not line:
                 continue
-            if line.startswith("data: "):
-                data_str = line[6:]
-                if data_str == "[DONE]":
-                    await response.write(b"data: [DONE]\n\n")
-                    return response
+            if not line.startswith("data: "):
+                continue
+
+            data_str = line[6:]
+            if data_str == "[DONE]":
+                break
+
+            try:
+                event_data = json.loads(data_str)
+            except json.JSONDecodeError:
+                log.warning("Unparseable upstream SSE data: %s", data_str[:200])
+                continue
+
+            event_type = event_data.get("type", "")
+            sse_lines = translator.translate_event(event_type, event_data)
+            for sse_line in sse_lines:
+                translated_payload = _parse_sse_data_line(sse_line)
+                if translated_payload is None:
+                    continue
+                if translated_payload == "[DONE]":
+                    break
+
                 try:
-                    event_data = json.loads(data_str)
-                    event_type = event_data.get("type", "")
-                    sse_lines = translator.translate_event(event_type, event_data)
-                    for sse_line in sse_lines:
-                        await response.write(sse_line.encode())
+                    translated_chunk = json.loads(translated_payload)
                 except json.JSONDecodeError:
-                    log.warning("Unparseable SSE data: %s", data_str[:200])
+                    continue
+
+                if not isinstance(translated_chunk, dict):
+                    continue
+                if "error" in translated_chunk:
+                    return web.json_response({"error": translated_chunk["error"]}, status=502)
+                translated_chunks.append(translated_chunk)
+
+        completion = _aggregate_nonstream_chat_completion(translated_chunks)
+        if completion is not None:
+            return web.json_response(completion)
+
+        return web.json_response(
+            {"error": {"message": "Missing translated completion data", "type": "upstream_error"}},
+            status=502,
+        )
 
     except Exception as e:
         log.error("Connection error: %s", e)
-        error_chunk = json.dumps({"error": {"message": str(e), "type": "connection_error"}})
-        await response.write(f"data: {error_chunk}\n\n".encode())
-        await response.write(b"data: [DONE]\n\n")
-
-    return response
+        if client_stream and response is not None:
+            error_chunk = json.dumps({"error": {"message": str(e), "type": "connection_error"}})
+            await response.write(f"data: {error_chunk}\n\n".encode())
+            await response.write(b"data: [DONE]\n\n")
+            return response
+        return web.json_response(
+            {"error": {"message": str(e), "type": "connection_error"}},
+            status=502,
+        )
 
 
 async def handle_responses(request: web.Request) -> web.StreamResponse | web.Response:
