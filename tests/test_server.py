@@ -171,3 +171,24 @@ def test_normalize_responses_body_normalizes_litellm_input_and_strict_null():
             "strict": False,
         }
     ]
+    assert body["parallel_tool_calls"] is False
+
+
+def test_normalize_responses_body_keeps_explicit_parallel_tool_calls():
+    body, _ = _normalize_responses_body(
+        {
+            "model": "gpt-5.3-codex",
+            "input": "hi",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "search_docs",
+                    "description": "Search docs",
+                    "parameters": {"type": "object"},
+                }
+            ],
+            "parallel_tool_calls": True,
+        }
+    )
+
+    assert body["parallel_tool_calls"] is True

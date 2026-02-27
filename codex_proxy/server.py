@@ -204,6 +204,11 @@ def _normalize_responses_body(raw_body: dict[str, Any]) -> tuple[dict[str, Any],
         body["tools"] = _normalize_responses_tools(body.get("tools"))
     if "tool_choice" in body:
         body["tool_choice"] = _normalize_responses_tool_choice(body.get("tool_choice"))
+    if body.get("tools") and "parallel_tool_calls" not in body:
+        # LiteLLM <=1.81.x responses streaming chunks use a fixed tool index (0),
+        # which can merge multiple calls in downstream aggregators.
+        # Default to sequential tool calls unless the client explicitly opts in.
+        body["parallel_tool_calls"] = False
 
     # ChatGPT Codex responses endpoint currently enforces stream=true.
     # For client stream=false, we aggregate upstream SSE into a final JSON response.
