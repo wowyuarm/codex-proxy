@@ -86,6 +86,7 @@ curl http://localhost:8787/v1/chat/completions \
 - `gpt-5.2-codex`
 - `gpt-5.3-codex`
 - `gpt-5.3-codex-spark`
+- `gpt-5.4`
 
 ### Endpoints
 

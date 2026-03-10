@@ -28,7 +28,6 @@ _UNSUPPORTED_PARAMS = {
     "modalities",
     "audio",
     "prediction",
-    "reasoning_effort",
     "service_tier",
 }
 
@@ -118,6 +117,14 @@ def chat_to_responses(request: dict[str, Any]) -> dict[str, Any]:
         "input": input_items,
         "include": ["reasoning.encrypted_content"],
     }
+
+    reasoning_effort = request.get("reasoning_effort")
+    if isinstance(reasoning_effort, str) and reasoning_effort:
+        body["reasoning"] = {"effort": reasoning_effort}
+
+    verbosity = request.get("verbosity")
+    if isinstance(verbosity, str) and verbosity:
+        body["text"] = {"verbosity": verbosity}
 
     if request.get("tools"):
         body["tools"] = _convert_tools(request["tools"])

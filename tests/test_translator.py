@@ -123,6 +123,17 @@ class TestChatToResponses:
         assert "temperature" not in result
         assert "max_tokens" not in result
 
+    def test_reasoning_effort_and_verbosity_mapped(self):
+        request = {
+            "model": "gpt-5.1",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "reasoning_effort": "medium",
+            "verbosity": "medium",
+        }
+        result = chat_to_responses(request)
+        assert result["reasoning"] == {"effort": "medium"}
+        assert result["text"] == {"verbosity": "medium"}
+
     def test_multiple_system_messages_concatenated(self):
         request = {
             "model": "gpt-5.1",

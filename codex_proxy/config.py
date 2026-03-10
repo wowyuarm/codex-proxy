@@ -34,4 +34,5 @@ CODEX_MODELS = [
     {"id": "gpt-5.2-codex", "object": "model", "owned_by": "openai"},
     {"id": "gpt-5.3-codex", "object": "model", "owned_by": "openai"},
     {"id": "gpt-5.3-codex-spark", "object": "model", "owned_by": "openai"},
+    {"id": "gpt-5.4", "object": "model", "owned_by": "openai"},
 ]
