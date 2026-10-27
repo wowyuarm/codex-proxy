@@ -55,6 +55,43 @@ def serve(host: str, port: int) -> None:
     run_server(host, port)
 
 
+async def _fetch_live_models() -> list[dict[str, Any]]:
+    from codex_proxy.auth import ensure_credentials
+    from codex_proxy.models import ModelCatalog
+
+    credentials = await ensure_credentials()
+    return await ModelCatalog().refresh(credentials)
+
+
+@main.command()
+def models() -> None:
+    """List the models the active account can use."""
+    try:
+        catalog = asyncio.run(_fetch_live_models())
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if not catalog:
+        from codex_proxy.config import FALLBACK_MODELS
+
+        click.echo("Could not reach the upstream model list. Built-in fallback:")
+        for model_id in FALLBACK_MODELS:
+            click.echo(f"  {model_id}")
+        return
+
+    for entry in catalog:
+        if not entry["visible"]:
+            continue
+        efforts = ", ".join(entry.get("reasoning_efforts") or []) or "-"
+        click.echo(f"{entry['slug']}")
+        click.echo(f"  name:    {entry['display_name']}")
+        click.echo(f"  effort:  {efforts}")
+        if entry.get("context_window"):
+            click.echo(f"  context: {entry['context_window']}")
+        if entry.get("description"):
+            click.echo(f"  about:   {entry['description']}")
+
+
 @main.command()
 def status() -> None:
     """Show current authentication status."""

@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-`codex_proxy/` holds the runtime code. Keep CLI entrypoints in `codex_proxy/cli.py`, HTTP server logic in `codex_proxy/server.py`, request/response mapping in `codex_proxy/translator.py`, and account or auth state in `codex_proxy/accounts.py`, `codex_proxy/auth.py`, and `codex_proxy/config.py`. Put tests in `tests/` with names like `test_server.py` and `test_auth.py`. `README.md` is the user-facing setup guide; update it when commands or behavior change.
+`codex_proxy/` holds the runtime code. Keep CLI entrypoints in `codex_proxy/cli.py`, HTTP server logic in `codex_proxy/server.py`, request/response mapping in `codex_proxy/translator.py`, the upstream model catalog in `codex_proxy/models.py`, and account or auth state in `codex_proxy/accounts.py`, `codex_proxy/auth.py`, and `codex_proxy/config.py`. Put tests in `tests/` with names like `test_server.py` and `test_auth.py`. `README.md` is the user-facing setup guide; update it when commands or behavior change.
 
 ## Build, Test, and Development Commands
 Use Python 3.11+ and the repo-local virtual environment in `.venv`.
@@ -14,9 +14,10 @@ Activates the local environment and installs the package in editable mode with t
 
 ```bash
 codex-proxy login
+codex-proxy models
 codex-proxy serve -p 9000
 ```
-Logs into ChatGPT and starts the local proxy for manual checks.
+Logs into ChatGPT, prints the live model catalog, and starts the local proxy for manual checks.
 
 ```bash
 pytest

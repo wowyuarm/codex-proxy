@@ -1,4 +1,5 @@
-"""Translate between OpenAI Chat Completions and ChatGPT Responses API formats."""
+"""Translate between OpenAI Chat Completions, Anthropic Messages, and the
+ChatGPT Responses API formats."""
 
 import json
 import logging
@@ -6,19 +7,20 @@ import time
 import uuid
 from typing import Any
 
+from codex_proxy.config import DEFAULT_MODEL
+from codex_proxy.models import normalize_reasoning_effort, resolve_model_name
+
 log = logging.getLogger(__name__)
 
-# Parameters that the Codex/Responses API does not support.
-# We log a warning when clients send these so failures are traceable.
+# Chat Completions parameters the Codex backend rejects outright. They are
+# dropped (with a warning) instead of forwarded so clients get an answer
+# rather than a 400 from upstream.
 _UNSUPPORTED_PARAMS = {
     "temperature",
     "top_p",
     "frequency_penalty",
     "presence_penalty",
-    "max_tokens",
-    "max_completion_tokens",
     "stop",
-    "response_format",
     "logprobs",
     "top_logprobs",
     "seed",
@@ -28,52 +30,38 @@ _UNSUPPORTED_PARAMS = {
     "modalities",
     "audio",
     "prediction",
-    "service_tier",
+    "prompt_cache_retention",
+    "safety_identifier",
 }
 
-_CLAUDE_MODEL_ALIASES = {
-    "claude-opus": "gpt-5.4",
-    "claude-sonnet": "gpt-5.3-codex",
-    "claude-haiku": "gpt-5.4-mini",
-}
+_SERVICE_TIERS = {"default", "priority"}
 
 
-def chat_to_responses(request: dict[str, Any]) -> dict[str, Any]:
-    """Convert a Chat Completions request to a Responses API request body.
-
-    Input: standard OpenAI /v1/chat/completions request
-    Output: ChatGPT /backend-api/responses request body
-    """
-    # Warn about unsupported parameters so clients can trace silent drops.
+def chat_to_responses(
+    request: dict[str, Any], models: list[dict[str, Any]] | None = None
+) -> dict[str, Any]:
+    """Convert a Chat Completions request to a Responses API request body."""
     dropped = _UNSUPPORTED_PARAMS & request.keys()
     if dropped:
         log.warning("Dropping unsupported parameters: %s", ", ".join(sorted(dropped)))
 
-    messages = request.get("messages", [])
-    system_parts: list[str] = []
     input_items: list[dict[str, Any]] = []
+    instruction_parts: list[str] = []
 
-    for msg in messages:
+    for msg in request.get("messages", []):
         role = msg.get("role", "")
         content = msg.get("content", "")
 
-        if role == "system":
-            # Collect all system messages; they are concatenated later.
+        if role in {"system", "developer"}:
             text = _extract_text(content)
             if text:
-                system_parts.append(text)
+                instruction_parts.append(text)
 
         elif role == "user":
-            input_items.append(
-                {
-                    "role": "user",
-                    "content": _to_input_content(content),
-                }
-            )
+            input_items.append({"role": "user", "content": _to_input_content(content)})
 
         elif role == "assistant":
             tool_calls = msg.get("tool_calls")
-            # Preserve text content even when tool_calls coexist.
             text = _extract_text(content)
             if text:
                 input_items.append(
@@ -83,22 +71,22 @@ def chat_to_responses(request: dict[str, Any]) -> dict[str, Any]:
                         "content": [{"type": "output_text", "text": text}],
                     }
                 )
-            if tool_calls:
-                for tc in tool_calls:
-                    fn = tc.get("function", {})
-                    call_id = _normalize_tool_call_id(tc.get("id", ""))
-                    input_items.append(
-                        {
-                            "type": "function_call",
-                            "id": call_id,
-                            "call_id": call_id,
-                            "name": fn.get("name", ""),
-                            "arguments": fn.get("arguments", ""),
-                        }
-                    )
+            for tool_call in tool_calls or []:
+                if not isinstance(tool_call, dict):
+                    continue
+                fn = tool_call.get("function", {})
+                call_id = _normalize_tool_call_id(tool_call.get("id", ""))
+                input_items.append(
+                    {
+                        "type": "function_call",
+                        "id": call_id,
+                        "call_id": call_id,
+                        "name": fn.get("name", ""),
+                        "arguments": fn.get("arguments", ""),
+                    }
+                )
 
         elif role == "tool":
-            # Tool result → function_call_output
             call_id = _normalize_tool_call_id(msg.get("tool_call_id", ""))
             input_items.append(
                 {
@@ -108,35 +96,123 @@ def chat_to_responses(request: dict[str, Any]) -> dict[str, Any]:
                 }
             )
 
-    # Strip provider prefix (e.g. "vllm/gpt-5.1" → "gpt-5.1")
-    model = _normalize_model_name(request.get("model"), default="gpt-5.1")
-
-    instructions = "\n\n".join(system_parts) if system_parts else "You are a helpful assistant."
+    model = resolve_model_name(request.get("model"), models or [])
 
     body: dict[str, Any] = {
         "model": model,
         "stream": True,
         "store": False,
-        "instructions": instructions,
+        "instructions": "\n\n".join(instruction_parts) or "You are a helpful assistant.",
         "input": input_items,
         "include": ["reasoning.encrypted_content"],
     }
 
-    reasoning_effort = request.get("reasoning_effort")
-    if isinstance(reasoning_effort, str) and reasoning_effort:
-        body["reasoning"] = {"effort": reasoning_effort}
+    reasoning = _build_reasoning(request, model, models or [])
+    if reasoning:
+        body["reasoning"] = reasoning
 
-    verbosity = request.get("verbosity")
-    if isinstance(verbosity, str) and verbosity:
-        body["text"] = {"verbosity": verbosity}
+    text = _build_text_controls(request)
+    if text:
+        body["text"] = text
+
+    max_output_tokens = first_int(
+        request.get("max_output_tokens"),
+        request.get("max_completion_tokens"),
+        request.get("max_tokens"),
+    )
+    if max_output_tokens is not None:
+        body["max_output_tokens"] = max_output_tokens
+
+    service_tier = request.get("service_tier")
+    if isinstance(service_tier, str) and service_tier in _SERVICE_TIERS:
+        body["service_tier"] = service_tier
 
     if request.get("tools"):
         body["tools"] = _convert_tools(request["tools"])
-        # Only set tool_choice / parallel_tool_calls when tools are present
         body["tool_choice"] = request.get("tool_choice", "auto")
         body["parallel_tool_calls"] = request.get("parallel_tool_calls", True)
 
     return body
+
+
+def first_int(*values: Any) -> int | None:
+    for value in values:
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return None
+
+
+def _build_reasoning(
+    request: dict[str, Any], model: str, models: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    """Build the `reasoning` block from OpenAI or Claude-style request fields."""
+    reasoning: dict[str, Any] = {}
+
+    effort = normalize_reasoning_effort(request.get("reasoning_effort"), model, models)
+    if effort:
+        reasoning["effort"] = effort
+
+    raw = request.get("reasoning")
+    if isinstance(raw, dict):
+        effort = normalize_reasoning_effort(raw.get("effort"), model, models)
+        if effort:
+            reasoning["effort"] = effort
+        summary = raw.get("summary")
+        if isinstance(summary, str) and summary in {"auto", "concise", "detailed"}:
+            reasoning["summary"] = summary
+
+    # Clients that want visible thinking ask for a summary; without this the
+    # backend sends no reasoning events at all.
+    if "effort" in reasoning and "summary" not in reasoning:
+        reasoning["summary"] = "auto"
+
+    return reasoning or None
+
+
+def _build_text_controls(request: dict[str, Any]) -> dict[str, Any]:
+    """Merge `response_format` and `verbosity` into the Responses `text` block."""
+    text: dict[str, Any] = {}
+
+    raw_text = request.get("text")
+    if isinstance(raw_text, dict):
+        text.update(raw_text)
+
+    fmt = _convert_response_format(request.get("response_format"))
+    if fmt:
+        text["format"] = fmt
+
+    verbosity = request.get("verbosity")
+    if isinstance(verbosity, str) and verbosity in {"low", "medium", "high"}:
+        text["verbosity"] = verbosity
+
+    return text
+
+
+def _convert_response_format(response_format: Any) -> dict[str, Any] | None:
+    """Convert Chat Completions `response_format` into Responses `text.format`."""
+    if not isinstance(response_format, dict):
+        return None
+
+    fmt_type = response_format.get("type")
+    if fmt_type == "json_object":
+        return {"type": "json_object"}
+    if fmt_type == "text":
+        return None
+    if fmt_type == "json_schema":
+        schema_spec = response_format.get("json_schema")
+        if not isinstance(schema_spec, dict):
+            return None
+        converted: dict[str, Any] = {
+            "type": "json_schema",
+            "name": schema_spec.get("name") or "response",
+            "schema": schema_spec.get("schema") or {},
+            "strict": bool(schema_spec.get("strict")),
+        }
+        description = schema_spec.get("description")
+        if isinstance(description, str) and description:
+            converted["description"] = description
+        return converted
+    return None
 
 
 def _extract_text(content: Any) -> str:
@@ -161,35 +237,38 @@ def _to_input_content(content: Any) -> list[dict[str, Any]]:
     if isinstance(content, list):
         result = []
         for part in content:
-            if isinstance(part, dict):
-                if part.get("type") in {"text", "output_text"}:
-                    result.append({"type": "input_text", "text": part.get("text", "")})
-                elif part.get("type") == "image_url":
-                    image_url = part.get("image_url")
-                    if isinstance(image_url, dict):
-                        url = image_url.get("url", "")
-                        detail = image_url.get("detail")
-                    else:
-                        url = image_url or ""
-                        detail = None
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") in {"text", "output_text"}:
+                result.append({"type": "input_text", "text": part.get("text", "")})
+            elif part.get("type") == "image_url":
+                image_url = part.get("image_url")
+                if isinstance(image_url, dict):
+                    url = image_url.get("url", "")
+                    detail = image_url.get("detail")
+                else:
+                    url = image_url or ""
+                    detail = None
 
-                    input_image: dict[str, Any] = {"type": "input_image", "image_url": url}
-                    if detail:
-                        input_image["detail"] = detail
+                input_image: dict[str, Any] = {"type": "input_image", "image_url": url}
+                if detail:
+                    input_image["detail"] = detail
+                result.append(input_image)
+            elif part.get("type") == "image":
+                input_image = _anthropic_image_to_input_image(part)
+                if input_image is not None:
                     result.append(input_image)
-                elif part.get("type") == "image":
-                    input_image = _anthropic_image_to_input_image(part)
-                    if input_image is not None:
-                        result.append(input_image)
         return result
     return [{"type": "input_text", "text": str(content)}]
 
 
-def anthropic_messages_to_responses(request: dict[str, Any]) -> dict[str, Any]:
+def anthropic_messages_to_responses(
+    request: dict[str, Any], models: list[dict[str, Any]] | None = None
+) -> dict[str, Any]:
     """Convert Anthropic Messages payloads into ChatGPT Responses payloads."""
     system = request.get("system")
     messages = request.get("messages", [])
-    model = _normalize_model_name(request.get("model"), default="gpt-5.4")
+    model = resolve_model_name(request.get("model"), models or [])
     input_items: list[dict[str, Any]] = []
 
     def flush_user_content(content: list[dict[str, Any]]) -> None:
@@ -199,13 +278,7 @@ def anthropic_messages_to_responses(request: dict[str, Any]) -> dict[str, Any]:
 
     def flush_assistant_content(content: list[dict[str, Any]]) -> None:
         if content:
-            input_items.append(
-                {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": list(content),
-                }
-            )
+            input_items.append({"type": "message", "role": "assistant", "content": list(content)})
             content.clear()
 
     for msg in messages:
@@ -218,8 +291,7 @@ def anthropic_messages_to_responses(request: dict[str, Any]) -> dict[str, Any]:
         if role == "user":
             text_or_media: list[dict[str, Any]] = []
             for part in _as_content_blocks(content):
-                part_type = part.get("type")
-                if part_type == "tool_result":
+                if part.get("type") == "tool_result":
                     flush_user_content(text_or_media)
                     call_id = _normalize_tool_call_id(part.get("tool_use_id", ""))
                     input_items.append(
@@ -254,10 +326,9 @@ def anthropic_messages_to_responses(request: dict[str, Any]) -> dict[str, Any]:
                         }
                     )
                     continue
-                if part_type == "thinking":
-                    text = part.get("thinking", "")
-                    if text:
-                        assistant_text.append({"type": "output_text", "text": text})
+                # Thinking blocks cannot be replayed upstream: we have no
+                # encrypted reasoning payload to pair them with.
+                if part_type in {"thinking", "redacted_thinking"}:
                     continue
 
                 normalized_part = _anthropic_part_to_assistant_content(part)
@@ -268,12 +339,16 @@ def anthropic_messages_to_responses(request: dict[str, Any]) -> dict[str, Any]:
 
     body: dict[str, Any] = {
         "model": model,
-        "stream": bool(request.get("stream", True)),
+        "stream": True,
         "store": False,
         "instructions": _extract_anthropic_system_text(system) or "You are a helpful assistant.",
         "input": input_items,
         "include": ["reasoning.encrypted_content"],
     }
+
+    max_tokens = first_int(request.get("max_tokens"))
+    if max_tokens is not None:
+        body["max_output_tokens"] = max_tokens
 
     tools = request.get("tools")
     if isinstance(tools, list) and tools:
@@ -281,9 +356,9 @@ def anthropic_messages_to_responses(request: dict[str, Any]) -> dict[str, Any]:
         body["tool_choice"] = _convert_anthropic_tool_choice(request.get("tool_choice"))
         body["parallel_tool_calls"] = False
 
-    thinking = _convert_anthropic_thinking(request.get("thinking"))
-    if thinking:
-        body["reasoning"] = thinking
+    reasoning = _convert_anthropic_thinking(request.get("thinking"), model, models or [])
+    if reasoning:
+        body["reasoning"] = reasoning
 
     return body
 
@@ -301,22 +376,6 @@ def _tool_call_id_to_anthropic(call_id: str) -> str:
     suffix = normalized[3:] if normalized.startswith("fc_") else normalized
     suffix = suffix.replace("-", "").replace("_", "")
     return f"toolu_{suffix[:40] or uuid.uuid4().hex[:12]}"
-
-
-def _normalize_model_name(model: Any, default: str) -> str:
-    if not isinstance(model, str) or not model:
-        return default
-    if "/" in model:
-        model = model.split("/", 1)[1]
-    lowered = model.lower()
-    for prefix, target in _CLAUDE_MODEL_ALIASES.items():
-        if lowered.startswith(prefix):
-            return target
-    return model
-
-
-def _normalize_tool_strict(value: Any) -> bool:
-    return value if isinstance(value, bool) else False
 
 
 def _as_content_blocks(content: Any) -> list[dict[str, Any]]:
@@ -420,45 +479,53 @@ def _convert_anthropic_tool_choice(tool_choice: Any) -> Any:
     return "auto"
 
 
-def _convert_anthropic_thinking(thinking: Any) -> dict[str, str] | None:
+def _convert_anthropic_thinking(
+    thinking: Any, model: str = DEFAULT_MODEL, models: list[dict[str, Any]] | None = None
+) -> dict[str, str] | None:
     if not thinking:
         return None
 
     if isinstance(thinking, dict):
         thinking_type = thinking.get("type")
         if thinking_type == "adaptive":
-            return {"effort": "high"}
+            return {"effort": "high", "summary": "auto"}
         if thinking_type == "enabled":
             budget = thinking.get("budget_tokens")
             if not isinstance(budget, int):
                 budget = thinking.get("budgetTokens")
             if isinstance(budget, int):
                 if budget >= 16000:
-                    return {"effort": "high"}
+                    return {"effort": "high", "summary": "auto"}
                 if budget <= 2048:
-                    return {"effort": "low"}
-            return {"effort": "medium"}
+                    return {"effort": "low", "summary": "auto"}
+            return {"effort": "medium", "summary": "auto"}
         if thinking_type == "disabled":
             return None
 
-    return {"effort": "medium"}
+    effort = normalize_reasoning_effort("medium", model, models or [])
+    return {"effort": effort or "medium", "summary": "auto"}
+
+
+def _normalize_tool_strict(value: Any) -> bool:
+    return value if isinstance(value, bool) else False
 
 
 def _convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Convert Chat Completions tools to Responses API format."""
     result = []
     for tool in tools:
-        if tool.get("type") == "function":
-            fn = tool.get("function", {})
-            result.append(
-                {
-                    "type": "function",
-                    "name": fn.get("name", ""),
-                    "description": fn.get("description", ""),
-                    "parameters": fn.get("parameters", {}),
-                    "strict": fn.get("strict", False),
-                }
-            )
+        if not isinstance(tool, dict) or tool.get("type") != "function":
+            continue
+        fn = tool.get("function", {})
+        result.append(
+            {
+                "type": "function",
+                "name": fn.get("name", ""),
+                "description": fn.get("description", ""),
+                "parameters": fn.get("parameters", {}),
+                "strict": _normalize_tool_strict(fn.get("strict")),
+            }
+        )
     return result
 
 
@@ -478,13 +545,7 @@ def make_chunk(
         "object": "chat.completion.chunk",
         "created": int(time.time()),
         "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "delta": delta,
-                "finish_reason": finish_reason,
-            }
-        ],
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
     }
     if usage:
         chunk["usage"] = usage
@@ -496,44 +557,73 @@ def format_sse(data: str) -> str:
     return f"data: {data}\n\n"
 
 
+def build_usage(response: dict[str, Any]) -> dict[str, Any] | None:
+    """Translate Responses usage into Chat Completions usage."""
+    usage_data = response.get("usage")
+    if not isinstance(usage_data, dict) or not usage_data:
+        return None
+    input_details = usage_data.get("input_tokens_details") or {}
+    output_details = usage_data.get("output_tokens_details") or {}
+    return {
+        "prompt_tokens": usage_data.get("input_tokens", 0),
+        "completion_tokens": usage_data.get("output_tokens", 0),
+        "total_tokens": usage_data.get("total_tokens", 0),
+        "prompt_tokens_details": {"cached_tokens": input_details.get("cached_tokens", 0)},
+        "completion_tokens_details": {
+            "reasoning_tokens": output_details.get("reasoning_tokens", 0)
+        },
+    }
+
+
+def _finish_reason_for(response: dict[str, Any], has_tool_calls: bool) -> str:
+    if has_tool_calls:
+        return "tool_calls"
+    status = response.get("status")
+    if status == "incomplete":
+        details = response.get("incomplete_details")
+        reason = details.get("reason") if isinstance(details, dict) else None
+        if reason == "content_filter":
+            return "content_filter"
+        return "length"
+    return "stop"
+
+
 class ResponseStreamTranslator:
-    """Stateful translator that converts Responses API SSE events
-    into OpenAI Chat Completions SSE chunks."""
+    """Converts Responses SSE events into OpenAI Chat Completions SSE chunks."""
 
     def __init__(self, model: str) -> None:
         self.model = model
         self.chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         self.sent_role = False
         self.tool_call_index = -1
-        # Track function_call item IDs to assign sequential indices
         self._fc_items: dict[str, int] = {}
+        self.finished = False
 
     def translate_event(self, event_type: str, event_data: dict[str, Any]) -> list[str]:
-        """Translate a single Responses API event into SSE lines.
-
-        Returns a list of SSE-formatted strings (may be empty).
-        """
         handler = _EVENT_HANDLERS.get(event_type)
         if handler:
             return handler(self, event_data)
         return []
+
+    def _emit_role(self) -> list[str]:
+        if self.sent_role:
+            return []
+        self.sent_role = True
+        chunk = make_chunk(self.chunk_id, self.model, {"role": "assistant", "content": ""})
+        return [format_sse(json.dumps(chunk))]
 
     def _on_output_item_added(self, data: dict[str, Any]) -> list[str]:
         item = data.get("item", {})
         item_type = item.get("type", "")
 
         if item_type == "message":
-            if not self.sent_role:
-                self.sent_role = True
-                chunk = make_chunk(self.chunk_id, self.model, {"role": "assistant", "content": ""})
-                return [format_sse(json.dumps(chunk))]
+            return self._emit_role()
 
-        elif item_type == "function_call":
+        if item_type == "function_call":
             self.tool_call_index += 1
             idx = self.tool_call_index
-            item_id = item.get("id", "")
-            self._fc_items[item_id] = idx
-            call_id = _normalize_tool_call_id(item.get("call_id", item_id))
+            self._fc_items[item.get("id", "")] = idx
+            call_id = _normalize_tool_call_id(item.get("call_id") or item.get("id", ""))
             delta = {
                 "tool_calls": [
                     {
@@ -544,8 +634,9 @@ class ResponseStreamTranslator:
                     }
                 ]
             }
-            chunk = make_chunk(self.chunk_id, self.model, delta)
-            return [format_sse(json.dumps(chunk))]
+            lines = self._emit_role()
+            lines.append(format_sse(json.dumps(make_chunk(self.chunk_id, self.model, delta))))
+            return lines
 
         return []
 
@@ -553,10 +644,21 @@ class ResponseStreamTranslator:
         delta_text = data.get("delta", "")
         if not delta_text:
             return []
-        if not self.sent_role:
-            self.sent_role = True
+        lines = self._emit_role()
         chunk = make_chunk(self.chunk_id, self.model, {"content": delta_text})
-        return [format_sse(json.dumps(chunk))]
+        lines.append(format_sse(json.dumps(chunk)))
+        return lines
+
+    def _on_reasoning_delta(self, data: dict[str, Any]) -> list[str]:
+        """Expose reasoning as `reasoning_content`, the field LiteLLM and
+        OpenRouter-style clients read."""
+        delta_text = data.get("delta", "")
+        if not delta_text:
+            return []
+        lines = self._emit_role()
+        chunk = make_chunk(self.chunk_id, self.model, {"reasoning_content": delta_text})
+        lines.append(format_sse(json.dumps(chunk)))
+        return lines
 
     def _on_function_args_delta(self, data: dict[str, Any]) -> list[str]:
         delta_text = data.get("delta", "")
@@ -564,58 +666,56 @@ class ResponseStreamTranslator:
             return []
         item_id = data.get("item_id", "")
         idx = self._fc_items.get(item_id, self.tool_call_index)
-        delta = {
-            "tool_calls": [
-                {
-                    "index": idx,
-                    "function": {"arguments": delta_text},
-                }
-            ]
-        }
-        chunk = make_chunk(self.chunk_id, self.model, delta)
-        return [format_sse(json.dumps(chunk))]
+        delta = {"tool_calls": [{"index": idx, "function": {"arguments": delta_text}}]}
+        return [format_sse(json.dumps(make_chunk(self.chunk_id, self.model, delta)))]
 
-    def _on_completed(self, data: dict[str, Any]) -> list[str]:
+    def _on_terminal(self, data: dict[str, Any]) -> list[str]:
+        """Handle `response.completed` and `response.incomplete` alike.
+
+        Treating `response.incomplete` as terminal matters: without it a
+        truncated response leaves the stream open and the client hangs.
+        """
         response = data.get("response", {})
-        usage_data = response.get("usage", {})
-
-        # Map stop reason
-        status = response.get("status", "completed")
-        finish_reason = "stop"
-        if status == "incomplete":
-            finish_reason = "length"
-        if self.tool_call_index >= 0:
-            finish_reason = "tool_calls"
-
-        usage = None
-        if usage_data:
-            input_details = usage_data.get("input_tokens_details", {})
-            usage = {
-                "prompt_tokens": usage_data.get("input_tokens", 0),
-                "completion_tokens": usage_data.get("output_tokens", 0),
-                "total_tokens": usage_data.get("total_tokens", 0),
-                "prompt_tokens_details": {
-                    "cached_tokens": input_details.get("cached_tokens", 0),
-                },
-            }
-
+        finish_reason = _finish_reason_for(response, self.tool_call_index >= 0)
+        usage = build_usage(response)
+        lines = self._emit_role()
         chunk = make_chunk(self.chunk_id, self.model, {}, finish_reason, usage)
-        lines = [format_sse(json.dumps(chunk))]
+        lines.append(format_sse(json.dumps(chunk)))
         lines.append(format_sse("[DONE]"))
+        self.finished = True
         return lines
 
     def _on_error(self, data: dict[str, Any]) -> list[str]:
         chunk = make_chunk(self.chunk_id, self.model, {}, "stop")
         chunk["error"] = data
+        self.finished = True
         return [format_sse(json.dumps(chunk)), format_sse("[DONE]")]
+
+    def finish(self) -> list[str]:
+        """Close the stream when upstream ends without a terminal event.
+
+        Idempotent: a completed stream already emitted its final chunk, so a
+        second call would leave the client with two `finish_reason` chunks.
+        """
+        if self.finished:
+            return []
+        self.finished = True
+        lines = self._emit_role()
+        chunk = make_chunk(self.chunk_id, self.model, {}, "stop")
+        lines.append(format_sse(json.dumps(chunk)))
+        lines.append(format_sse("[DONE]"))
+        return lines
 
 
 _EVENT_HANDLERS: dict[str, Any] = {
     "response.output_item.added": ResponseStreamTranslator._on_output_item_added,
     "response.output_text.delta": ResponseStreamTranslator._on_text_delta,
     "response.content_part.delta": ResponseStreamTranslator._on_text_delta,
+    "response.reasoning_summary_text.delta": ResponseStreamTranslator._on_reasoning_delta,
+    "response.reasoning_text.delta": ResponseStreamTranslator._on_reasoning_delta,
     "response.function_call_arguments.delta": ResponseStreamTranslator._on_function_args_delta,
-    "response.completed": ResponseStreamTranslator._on_completed,
+    "response.completed": ResponseStreamTranslator._on_terminal,
+    "response.incomplete": ResponseStreamTranslator._on_terminal,
     "error": ResponseStreamTranslator._on_error,
     "response.failed": ResponseStreamTranslator._on_error,
 }
@@ -639,6 +739,7 @@ class AnthropicStreamTranslator:
         self.current_stop_reason = "end_turn"
         self.usage = {"input_tokens": 0, "output_tokens": 0}
         self.content: list[dict[str, Any]] = []
+        self.error: dict[str, Any] | None = None
         self._tool_call_by_item_id: dict[str, str] = {}
         self._tool_input_buffers: dict[str, str] = {}
 
@@ -691,10 +792,7 @@ class AnthropicStreamTranslator:
         self.current_block_type = None
         self.current_item_id = None
         return [
-            _format_anthropic_sse(
-                "content_block_stop",
-                {"type": "content_block_stop", "index": index},
-            )
+            _format_anthropic_sse("content_block_stop", {"type": "content_block_stop", "index": index})
         ]
 
     def _start_text_block(self) -> list[str]:
@@ -718,11 +816,32 @@ class AnthropicStreamTranslator:
         )
         return lines
 
+    def _start_thinking_block(self) -> list[str]:
+        if self.current_block_type == "thinking":
+            return []
+        lines = self._ensure_started()
+        lines.extend(self._close_current_block())
+        self.current_block_index = len(self.content)
+        self.current_block_type = "thinking"
+        self.current_item_id = None
+        self.content.append({"type": "thinking", "thinking": "", "signature": ""})
+        lines.append(
+            _format_anthropic_sse(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": self.current_block_index,
+                    "content_block": {"type": "thinking", "thinking": ""},
+                },
+            )
+        )
+        return lines
+
     def _start_tool_block(self, item: dict[str, Any]) -> list[str]:
         lines = self._ensure_started()
         lines.extend(self._close_current_block())
         item_id = item.get("id", "")
-        tool_id = _tool_call_id_to_anthropic(item.get("call_id", item_id))
+        tool_id = _tool_call_id_to_anthropic(item.get("call_id") or item_id)
         self._tool_call_by_item_id[item_id] = tool_id
         self._tool_input_buffers[item_id] = ""
         self.current_stop_reason = "tool_use"
@@ -730,12 +849,7 @@ class AnthropicStreamTranslator:
         self.current_block_type = "tool_use"
         self.current_item_id = item_id
         self.content.append(
-            {
-                "type": "tool_use",
-                "id": tool_id,
-                "name": item.get("name", ""),
-                "input": {},
-            }
+            {"type": "tool_use", "id": tool_id, "name": item.get("name", ""), "input": {}}
         )
         lines.append(
             _format_anthropic_sse(
@@ -777,6 +891,25 @@ class AnthropicStreamTranslator:
         )
         return lines
 
+    def _on_reasoning_delta(self, data: dict[str, Any]) -> list[str]:
+        delta_text = data.get("delta", "")
+        if not delta_text:
+            return []
+        lines = self._start_thinking_block()
+        assert self.current_block_index is not None
+        self.content[self.current_block_index]["thinking"] += delta_text
+        lines.append(
+            _format_anthropic_sse(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": self.current_block_index,
+                    "delta": {"type": "thinking_delta", "thinking": delta_text},
+                },
+            )
+        )
+        return lines
+
     def _on_function_args_delta(self, data: dict[str, Any]) -> list[str]:
         item_id = data.get("item_id", "")
         delta_text = data.get("delta", "")
@@ -811,7 +944,8 @@ class AnthropicStreamTranslator:
             )
         ]
 
-    def _on_completed(self, data: dict[str, Any]) -> list[str]:
+    def _on_terminal(self, data: dict[str, Any]) -> list[str]:
+        """Close the message for both `response.completed` and `response.incomplete`."""
         response = data.get("response", {})
         usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
         incomplete = (
@@ -820,10 +954,15 @@ class AnthropicStreamTranslator:
             else {}
         )
         reason = incomplete.get("reason")
-        if reason in {"max_tokens", "max_output_tokens"} or response.get("status") == "incomplete":
-            self.current_stop_reason = "max_tokens"
-        elif reason == "model_context_window_exceeded":
-            self.current_stop_reason = "model_context_window_exceeded"
+        if self.current_stop_reason != "tool_use":
+            if reason == "content_filter":
+                self.current_stop_reason = "refusal"
+            elif reason in {"max_tokens", "max_output_tokens"} or (
+                response.get("status") == "incomplete"
+            ):
+                self.current_stop_reason = "max_tokens"
+            elif reason == "model_context_window_exceeded":
+                self.current_stop_reason = "model_context_window_exceeded"
 
         self.usage = {
             "input_tokens": usage.get("input_tokens", 0),
@@ -836,10 +975,7 @@ class AnthropicStreamTranslator:
                 "message_delta",
                 {
                     "type": "message_delta",
-                    "delta": {
-                        "stop_reason": self.current_stop_reason,
-                        "stop_sequence": None,
-                    },
+                    "delta": {"stop_reason": self.current_stop_reason, "stop_sequence": None},
                     "usage": dict(self.usage),
                 },
             )
@@ -848,19 +984,23 @@ class AnthropicStreamTranslator:
         self.closed = True
         return lines
 
+    def finish(self) -> list[str]:
+        """Close the message when upstream ends without a terminal event.
+
+        Idempotent: a closed message already emitted `message_stop`.
+        """
+        if self.closed:
+            return []
+        return self._on_terminal({})
+
     def _on_error(self, data: dict[str, Any]) -> list[str]:
         payload = data.get("error", data)
+        self.error = payload if isinstance(payload, dict) else {"message": str(payload)}
+        self.closed = True
         return [
             _format_anthropic_sse(
                 "error",
-                {
-                    "type": "error",
-                    "error": (
-                        payload
-                        if isinstance(payload, dict)
-                        else {"message": str(payload)}
-                    ),
-                },
+                {"type": "error", "error": self.error},
             )
         ]
 
@@ -869,8 +1009,11 @@ _ANTHROPIC_EVENT_HANDLERS: dict[str, Any] = {
     "response.output_item.added": AnthropicStreamTranslator._on_output_item_added,
     "response.output_text.delta": AnthropicStreamTranslator._on_text_delta,
     "response.content_part.delta": AnthropicStreamTranslator._on_text_delta,
+    "response.reasoning_summary_text.delta": AnthropicStreamTranslator._on_reasoning_delta,
+    "response.reasoning_text.delta": AnthropicStreamTranslator._on_reasoning_delta,
     "response.function_call_arguments.delta": AnthropicStreamTranslator._on_function_args_delta,
-    "response.completed": AnthropicStreamTranslator._on_completed,
+    "response.completed": AnthropicStreamTranslator._on_terminal,
+    "response.incomplete": AnthropicStreamTranslator._on_terminal,
     "error": AnthropicStreamTranslator._on_error,
     "response.failed": AnthropicStreamTranslator._on_error,
 }
